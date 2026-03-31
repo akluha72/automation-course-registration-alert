@@ -26,10 +26,10 @@ STUDENT_ID       = "2023630358"
 STUDENT_PASSWORD = "luTfi@kmal72"
 
 # Course code to register (shown in "Register New Courses" page)
-TARGET_COURSE = "CSP650"
+TARGET_COURSE = "ICT600"
 
 # Group name to monitor. Set to None to alert on ANY available group.
-TARGET_GROUP = "NBCS24010A"
+TARGET_GROUP = "NBCS2406A"
 
 # How often to check in seconds
 CHECK_INTERVAL = 30
