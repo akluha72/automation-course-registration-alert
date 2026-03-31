@@ -1,223 +1,304 @@
-
+"""
 UiTM ECR Course Slot Monitor
 =============================
-Monitors a specific course group page and alerts you when a slot opens up.
+Monitors a course group page and alerts you when a slot opens.
 
-SETUP
-  pip install requests beautifulsoup4 plyer
+SETUP:
+    pip install playwright plyer
+    playwright install chromium
 
-USAGE
-  python uitm_monitor.py
+USAGE:
+    python init.py
+"""
 
-Fill in your credentials and target course URL below.
-
-
-import requests
-from bs4 import BeautifulSoup
+import re
 import time
-import winsound  # Windows only for beep — see cross-platform note below
 import os
 import sys
 from datetime import datetime
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 # ─────────────────────────────────────────
-#  CONFIGURATION — fill these in
+#  CONFIGURATION
 # ─────────────────────────────────────────
 
-STUDENT_ID       = 2023630358        # Your UiTM Student ID
-STUDENT_PASSWORD = YOUR_PASSWORD     # Your student portal password
+STUDENT_ID       = "2023630358"
+STUDENT_PASSWORD = "luTfi@kmal72"
 
-# The URL of the group selection page for your target course
-# (the page shown in your screenshot)
-TARGET_URL = httpsecr.uitm.edu.myestudentecr01_cr_register_select.cfmkey1=37B31FC9DFCAE9CF4C&key2=0C1CCA78009ACB07C0
+# Course code to register (shown in "Register New Courses" page)
+TARGET_COURSE = "CSP650"
 
-# How often to check (in seconds). 10s is a safe interval — not too aggressive.
-CHECK_INTERVAL = 10
+# Group name to monitor. Set to None to alert on ANY available group.
+TARGET_GROUP = "NBCS24010A"
 
-# The group you want to monitor. Set to None to alert on ANY available group.
-# Example NBCS2406A  or  None
-TARGET_GROUP = None
+# How often to check in seconds
+CHECK_INTERVAL = 30
+
+# Set to False to see the browser window (recommended while testing)
+HEADLESS = False
+
+# ─────────────────────────────────────────
+#  URLS
+# ─────────────────────────────────────────
+
+BASE_URL     = "https://ecr.uitm.edu.my/estudent/ecr"
+LOGIN_URL    = f"{BASE_URL}/login.cfm"
+REGISTER_URL = f"{BASE_URL}/01_cr_register.cfm"
+
 
 # ─────────────────────────────────────────
 #  LOGIN
 # ─────────────────────────────────────────
 
-LOGIN_URL = httpsecr.uitm.edu.myestudentecrlogin.cfm
+def login(page):
+    """Navigate to login page and submit credentials. Returns True on success."""
+    print("Navigating to login page...")
+    page.goto(LOGIN_URL, wait_until="networkidle", timeout=30000)
 
-def create_session()
-    Log in and return an authenticated session.
-    session = requests.Session()
-    session.headers.update({
-        User-Agent Mozilla5.0 (Windows NT 10.0; Win64; x64) AppleWebKit537.36 Chrome120 Safari537.36,
-        Referer LOGIN_URL,
-    })
+    page.fill("input[name='txtUser']", STUDENT_ID)
+    page.fill("input[name='txtPass']", STUDENT_PASSWORD)
 
-    # First GET the login page to grab any hidden fields  cookies
-    resp = session.get(LOGIN_URL, timeout=15)
-    soup = BeautifulSoup(resp.text, html.parser)
+    # Try multiple possible button selectors
+    for selector in ["input[name='btnLogin']", "input[type='submit']", "button[type='submit']", "button:has-text('Login')"]:
+        try:
+            page.click(selector, timeout=3000)
+            break
+        except Exception:
+            continue
 
-    # Build login payload — adjust field names if login fails
-    payload = {
-        stuID   STUDENT_ID,
-        stuPass STUDENT_PASSWORD,
-    }
+    # Wait for redirect after login
+    try:
+        page.wait_for_url("**/main.cfm**", timeout=15000)
+        print("[OK] Login successful!")
+        return True
+    except PlaywrightTimeout:
+        final_url = page.url
+        print(f"[ERROR] Login failed. Final URL: {final_url}")
+        if "key=0" in final_url or "login" in final_url.lower():
+            print("  Hint: Wrong credentials or account temporarily locked.")
+        return False
 
-    # Include any hidden form fields (e.g. CSRF tokens)
-    for hidden in soup.find_all(input, type=hidden)
-        if hidden.get(name)
-            payload[hidden[name]] = hidden.get(value, )
 
-    login_resp = session.post(LOGIN_URL, data=payload, timeout=15)
+# ─────────────────────────────────────────
+#  FIND COURSE LINK
+# ─────────────────────────────────────────
 
-    if logout in login_resp.text.lower() or selection menu in login_resp.text.lower()
-        print(✅ Login successful!)
-        return session
-    else
-        print(❌ Login failed. Check your credentials or the login field names.)
-        print(   Hint Open browser DevTools  Network  login request  check form field names)
-        sys.exit(1)
+def get_course_url(page):
+    """
+    Go to the Register New Courses page, find the link for TARGET_COURSE,
+    and return the URL of its group selection page.
+    Returns: url string, None (not found), or "relogin" (session expired)
+    """
+    print("Finding course page...", end=" ", flush=True)
+
+    try:
+        page.goto(REGISTER_URL, wait_until="networkidle", timeout=30000)
+    except PlaywrightTimeout:
+        print("Timeout loading register page.")
+        return None
+
+    # Session expired — redirected back to login
+    if "login" in page.url.lower():
+        return "relogin"
+
+    # Scan all rows for course code in text, then extract URL from button onclick
+    rows = page.locator("table tbody tr").all()
+    for row in rows:
+        text = row.inner_text()
+        if TARGET_COURSE.upper() in text.upper():
+            # Button uses onclick="location.href = 'url';" instead of <a href>
+            button = row.locator("button[onclick]").first
+            try:
+                onclick = button.get_attribute("onclick", timeout=3000)
+                if onclick:
+                    match = re.search(r"location\.href\s*=\s*['\"]([^'\"]+)['\"]", onclick)
+                    if match:
+                        href = match.group(1)
+                        if not href.startswith("http"):
+                            href = f"{BASE_URL}/{href.lstrip('/')}"
+                        return href
+            except Exception:
+                continue
+
+    print(f"\n[WARN] Could not find course {TARGET_COURSE} on the register page.")
+    print("  Make sure the course is listed under '1.0 Register New Courses'.")
+    print("  Page text snippet:", page.inner_text("body")[:400])
+    return None
+
 
 # ─────────────────────────────────────────
 #  SLOT CHECKER
 # ─────────────────────────────────────────
 
-def check_slots(session)
-    
-    Fetch the course group page and return a list of available (not full) groups.
-    Returns list of dicts — [{group NBCS2406A, max 40, cur 35}]
-    
-    try
-        resp = session.get(TARGET_URL, timeout=15)
-    except requests.RequestException as e
-        print(f  ⚠️  Network error {e})
+def check_slots(page, course_url):
+    """
+    Fetch the group selection page and return available (not full) groups.
+    Returns:
+        list      - available groups (empty list = all full)
+        None      - network/timeout error
+        "relogin" - session expired
+    """
+    try:
+        page.goto(course_url, wait_until="networkidle", timeout=30000)
+    except PlaywrightTimeout:
+        print("Timeout loading course page.")
         return None
 
-    # Check if session expired
-    if login in resp.url.lower() or please enter your credentials in resp.text.lower()
-        print(  🔄 Session expired, re-logging in...)
-        return relogin
+    if "login" in page.url.lower():
+        return "relogin"
 
-    soup = BeautifulSoup(resp.text, html.parser)
-    rows = soup.select(table#dataTableExample1 tbody tr)
+    # Wait for table to appear
+    try:
+        page.wait_for_selector("table#dataTableExample1 tbody tr", timeout=10000)
+    except PlaywrightTimeout:
+        print("  [WARN] No table found - page structure may have changed.")
+        print("  Page snippet:", page.inner_text("body")[:300])
+        return []
 
+    rows = page.locator("table#dataTableExample1 tbody tr").all()
     available = []
 
-    for row in rows
-        cells = row.find_all(td)
-        if len(cells)  3
+    for row in rows:
+        cells = row.locator("td").all()
+        if len(cells) < 3:
             continue
 
-        group_info = cells[1].get_text( , strip=True)
-        action_cell = cells[2]
+        group_info  = cells[1].inner_text()
+        action_html = cells[2].inner_html()
 
-        # Parse MAX and CUR from group info text
-        # Format CampusB  Group  NBCS2406A ( MAX 40 - CUR  40 )
-        import re
-        match = re.search(rMAXs(d+).CURss(d+), group_info)
-        group_match = re.search(rGroupss(S+), group_info)
+        match       = re.search(r"MAX\s*:?\s*(\d+).*?CUR\s*:?\s*(\d+)", group_info)
+        group_match = re.search(r"Group\s*:?\s*(\S+)", group_info)
 
-        if not match
+        if not match:
             continue
 
-        max_slots = int(match.group(1))
-        cur_slots = int(match.group(2))
-        group_name = group_match.group(1) if group_match else Unknown
+        max_slots  = int(match.group(1))
+        cur_slots  = int(match.group(2))
+        group_name = group_match.group(1) if group_match else "Unknown"
 
-        # Determine if slot is available (no Full button)
-        is_full = bool(action_cell.find(button, string=lambda s s and Full in s))
+        is_full = "btn-danger" in action_html
 
-        if not is_full and cur_slots  max_slots
-            # Filter by target group if specified
-            if TARGET_GROUP is None or TARGET_GROUP.upper() in group_name.upper()
+        if not is_full and "btn-success" in action_html and cur_slots < max_slots:
+            if TARGET_GROUP is None or TARGET_GROUP.upper() in group_name.upper():
                 available.append({
-                    group group_name,
-                    max max_slots,
-                    cur cur_slots,
-                    slots_left max_slots - cur_slots
+                    "group":      group_name,
+                    "max":        max_slots,
+                    "cur":        cur_slots,
+                    "slots_left": max_slots - cur_slots,
                 })
 
     return available
+
 
 # ─────────────────────────────────────────
 #  ALERT
 # ─────────────────────────────────────────
 
-def alert(available_groups)
-    Make noise and print a big visible alert.
-    print(n + =  60)
-    print(🚨🚨🚨  SLOT AVAILABLE! GO REGISTER NOW!  🚨🚨🚨)
-    print(=  60)
-    for g in available_groups
-        print(f  ✅  Group {g['group']}    {g['cur']}{g['max']} filled    {g['slots_left']} slot(s) left)
-    print(fn  👉  Open this URL in your browser NOW)
-    print(f  {TARGET_URL})
-    print(=  60 + n)
+def alert(available_groups, course_url):
+    print("\n" + "=" * 60)
+    print("  *** SLOT AVAILABLE! GO REGISTER NOW! ***")
+    print("=" * 60)
+    for g in available_groups:
+        print(f"  Group: {g['group']}  |  {g['cur']}/{g['max']} filled  |  {g['slots_left']} slot(s) left")
+    print(f"\n  Open this in your browser NOW:")
+    print(f"  {course_url}")
+    print("=" * 60 + "\n")
 
-    # ── Desktop notification (cross-platform) ──
-    try
+    try:
         from plyer import notification
         notification.notify(
-            title=🚨 UiTM ECR — SLOT OPEN!,
-            message=fCourse slot available! Open browser NOW.n{available_groups[0]['group']} — {available_groups[0]['slots_left']} slot(s),
-            timeout=30
+            title="UiTM ECR - SLOT OPEN!",
+            message=f"{TARGET_COURSE} slot open! Register NOW. Group: {available_groups[0]['group']}",
+            timeout=30,
         )
-    except Exception
-        pass  # plyer not installed — that's fine, the beep + print still works
+    except Exception:
+        pass
 
-    # ── Audio alert ──
-    try
-        # Windows
-        for _ in range(5)
-            winsound.Beep(1000, 500)
-            time.sleep(0.2)
-    except Exception
-        # macOS  Linux fallback
-        try
-            os.system(afplay SystemLibrarySoundsGlass.aiff 2devnull  
-                      paplay usrsharesoundsfreedesktopstereocomplete.oga 2devnull  
-                      echo 'aaaaa')
-        except Exception
-            print(aaaaa)  # terminal bell
+    try:
+        import winsound
+        for _ in range(6):
+            winsound.Beep(1000, 400)
+            time.sleep(0.15)
+    except Exception:
+        os.system("printf '\a\a\a\a\a'")
+
 
 # ─────────────────────────────────────────
 #  MAIN LOOP
 # ─────────────────────────────────────────
 
-def main()
-    print(=  60)
-    print(  UiTM ECR Course Monitor)
-    print(f  Student ID  {STUDENT_ID})
-    print(f  Target URL  {TARGET_URL})
-    print(f  Interval    every {CHECK_INTERVAL}s)
-    print(f  Target grp  {TARGET_GROUP or 'ANY available group'})
-    print(=  60)
+def main():
+    print("=" * 60)
+    print("  UiTM ECR Course Monitor")
+    print(f"  Student    : {STUDENT_ID}")
+    print(f"  Course     : {TARGET_COURSE}")
+    print(f"  Group      : {TARGET_GROUP or 'ANY'}")
+    print(f"  Interval   : {CHECK_INTERVAL}s")
+    print(f"  Headless   : {HEADLESS}")
+    print("=" * 60)
 
-    session = create_session()
-    check_count = 0
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=HEADLESS)
+        context = browser.new_context()
+        page    = context.new_page()
 
-    while True
-        check_count += 1
-        now = datetime.now().strftime(%H%M%S)
-        print(f[{now}] Check #{check_count} ..., end= , flush=True)
+        # Initial login
+        if not login(page):
+            browser.close()
+            sys.exit(1)
 
-        result = check_slots(session)
+        course_url  = None
+        check_count = 0
 
-        if result == relogin
-            session = create_session()
-            continue
+        while True:
+            # Resolve course URL if we don't have it yet
+            if course_url is None:
+                course_url = get_course_url(page)
 
-        if result is None
-            print(error — retrying...)
-        elif len(result) == 0
-            print(All full. Waiting...)
-        else
-            print(fFOUND {len(result)} available group(s)!)
-            alert(result)
-            # Keep alerting every 30s until you register
-            time.sleep(30)
-            continue
+                if course_url == "relogin":
+                    print("Session expired, re-logging in...")
+                    if not login(page):
+                        browser.close()
+                        sys.exit(1)
+                    course_url = None
+                    continue
 
-        time.sleep(CHECK_INTERVAL)
+                if course_url is None:
+                    print(f"Course {TARGET_COURSE} not found. Retrying in 30s...")
+                    time.sleep(30)
+                    continue
 
-if __name__ == __main__
+                print(f"Found: {course_url}")
+
+            # Check slots
+            check_count += 1
+            now = datetime.now().strftime("%H:%M:%S")
+            print(f"[{now}] Check #{check_count} ...", end=" ", flush=True)
+
+            result = check_slots(page, course_url)
+
+            if result == "relogin":
+                print("Session expired, re-logging in...")
+                if not login(page):
+                    browser.close()
+                    sys.exit(1)
+                course_url = None
+                continue
+
+            if result is None:
+                print("Network error - retrying...")
+
+            elif len(result) == 0:
+                print("All full. Waiting...")
+
+            else:
+                print(f"FOUND {len(result)} available group(s)!")
+                alert(result, course_url)
+                time.sleep(30)
+                continue
+
+            time.sleep(CHECK_INTERVAL)
+
+
+if __name__ == "__main__":
     main()
